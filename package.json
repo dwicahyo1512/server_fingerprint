@@ -4,10 +4,12 @@
     "dev": "nodemon server.js"
   },
   "dependencies": {
+    "cors": "^2.8.5",
     "express": "^4.21.2",
     "http": "^0.0.1-security",
     "node-zklib": "^1.3.0",
     "socket.io": "^4.8.1",
+    "sqlite3": "^5.1.7",
     "zklib-js": "^1.3.5"
   },
   "devDependencies": {
