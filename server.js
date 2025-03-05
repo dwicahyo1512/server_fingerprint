@@ -6,9 +6,7 @@ const sqlite3 = require("sqlite3").verbose();
 const ZKLib = require("node-zklib");
 
 const app = express();
-const server = app.listen(3000, () => {
-  console.log("Server running on http://localhost:3000");
-});
+
 // Mengambil origin dari variabel lingkungan
 const allowedOrigin = process.env.CORS_ORIGIN || "*";
 
@@ -17,13 +15,20 @@ const corsOptions = {
   methods: ["GET", "POST", "PUT"],
   allowedHeaders: ["Content-Type"],
 };
-
+app.use(express.json());
 app.use(cors(corsOptions));
+
+const server = app.listen(3000, () => {
+  console.log("Server running on http://localhost:3000");
+});
 // Membuat WebSocket server
 const wss = new WebSocket.Server({ server });
 
 // Instance ZKLib global
 const zkInstance = new ZKLib("10.37.44.201", 4370, 10000, 4000);
+const zkInstance2 = new ZKLib("10.37.44.202", 4370, 10000, 4000);
+const zkInstance3 = new ZKLib("10.37.44.203", 4370, 10000, 4000);
+const zkInstance4 = new ZKLib("10.37.44.204", 4370, 10000, 4000);
 
 const db = new sqlite3.Database("./attendance.db", (err) => {
   if (err) {
@@ -35,26 +40,31 @@ const db = new sqlite3.Database("./attendance.db", (err) => {
 
 // Membuat tabel untuk menyimpan log kehadiran dan status pengambilan data user
 db.serialize(() => {
+  // Tabel untuk menyimpan informasi pengguna dengan kolom wla
   db.run(`CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wla INTEGER,
     user_id INTEGER,
     user_name TEXT,
     timestamp TEXT
   )`);
 
+  // Tabel untuk menyimpan status apakah data pengguna sudah diambil
   db.run(`CREATE TABLE IF NOT EXISTS user_fetch_status (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     is_fetched BOOLEAN DEFAULT 0
   )`);
 
+  // Tabel untuk menyimpan log kehadiran pengguna
   db.run(`CREATE TABLE IF NOT EXISTS user_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT,
     user_name TEXT,
-    wla TEXT,
+    wla INTEGER,
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
 
+  // Tabel untuk menyimpan informasi wla dan stok yang tersedia
   db.run(`CREATE TABLE IF NOT EXISTS wla_token (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     wla INTEGER,
@@ -155,20 +165,38 @@ async function connectFingerprintDevice() {
           };
 
           // Menyimpan log ke database
+          const checkExistingUser = `SELECT user_id FROM user_log WHERE user_id = ?`;
           const query = `INSERT INTO user_log (user_id, user_name, wla, timestamp) VALUES (?, ?, ?, ?)`;
+
           const timestamp = new Date(new Date().getTime() + 7 * 60 * 60 * 1000) // Menambahkan 7 jam
             .toISOString()
             .slice(0, 19) // Mengambil YYYY-MM-DD HH:MM:SS
             .replace("T", " ");
+          const userId = injectedData.userId; // ID pengguna yang akan diperiksa
+          // Memeriksa apakah user sudah ada
           await new Promise((resolve, reject) => {
-            db.run(
-              query,
-              [injectedData.userId, injectedData.userName, 1, timestamp],
-              (err) => {
-                if (err) reject(err);
-                resolve();
+            // Mengecek apakah user sudah ada
+            db.get(checkExistingUser, [userId], (err, row) => {
+              if (err) {
+                reject(err); // Menangani error
               }
-            );
+
+              if (row) {
+                resolve(); // Keluar dari promise tanpa melakukan insert
+              } else {
+                db.run(
+                  query,
+                  [userId, injectedData.userName, 1, timestamp],
+                  (err) => {
+                    if (err) {
+                      reject(err); // Menangani error
+                    } else {
+                      resolve(); // Menyelesaikan promise setelah insert selesai
+                    }
+                  }
+                );
+              }
+            });
           });
 
           // Kirim data real-time ke semua klien WebSocket
@@ -241,44 +269,89 @@ app.get("/log_user", async (req, res) => {
   }
 });
 
+app.get("/wla_stock", async (req, res) => {
+  try {
+    const query = `SELECT * FROM wla_token`;
+
+    // Use db.all to get data
+    db.all(query, [], (err, rows) => {
+      if (err) {
+        return res.status(500).send("Error fetching data");
+      }
+      res.json(rows);
+    });
+  } catch (err) {
+    res.status(500).send("Error fetching logs");
+  }
+});
+
+app.get("/user_log", async (req, res) => {
+  try {
+    const query = `SELECT * FROM user_log`;
+
+    // Use db.all to get data
+    db.all(query, [], (err, rows) => {
+      if (err) {
+        return res.status(500).send("Error fetching data");
+      }
+      res.json(rows);
+    });
+  } catch (err) {
+    res.status(500).send("Error fetching logs");
+  }
+});
+
 app.post("/post_admin", async (req, res) => {
   try {
-    const { limitPerShift } = req.body; // Ambil data dari body request
+    const { limitPerShift, wla } = req.body; // Ambil data dari body request
 
-    // Pastikan limitPerShift ada
+    // Validasi input
     if (!limitPerShift || isNaN(limitPerShift)) {
       return res.status(400).send("Invalid limitPerShift value");
     }
+    if (!wla) {
+      return res.status(400).send("Invalid wla value");
+    }
 
-    // Query untuk mengecek apakah ada entry limitPerShift yang sudah ada
+    // Query untuk mengecek apakah ada entry dengan wla yang sudah ada
     const checkQuery = `SELECT * FROM wla_token WHERE wla = ?`;
 
-    db.get(checkQuery, [limitPerShift], (err, row) => {
-      if (err) {
-        return res.status(500).send("Error checking existing data");
-      }
+    // Menggunakan promisify untuk query SQLite
+    const checkExistingData = (query, params) => {
+      return new Promise((resolve, reject) => {
+        db.get(query, params, (err, row) => {
+          if (err) {
+            reject(err);
+          } else {
+            resolve(row);
+          }
+        });
+      });
+    };
 
-      if (row) {
-        // Jika data sudah ada, lakukan UPDATE
-        const updateQuery = `UPDATE wla_token SET stock = ? WHERE wla = ?`;
-        db.run(updateQuery, [limitPerShift, limitPerShift], (err) => {
-          if (err) {
-            return res.status(500).send("Error updating data");
-          }
-          res.json({ message: "Data updated successfully" });
-        });
-      } else {
-        // Jika data belum ada, lakukan INSERT
-        const insertQuery = `INSERT INTO wla_token (wla, stock) VALUES (?, ?)`;
-        db.run(insertQuery, [limitPerShift, limitPerShift], (err) => {
-          if (err) {
-            return res.status(500).send("Error inserting data");
-          }
-          res.json({ message: "Data inserted successfully" });
-        });
-      }
-    });
+    const row = await checkExistingData(checkQuery, [wla]);
+
+    if (row) {
+      // Jika data sudah ada, lakukan UPDATE
+      const updateQuery = `UPDATE wla_token SET stock = ? WHERE wla = ?`;
+      db.run(updateQuery, [limitPerShift, wla], (err) => {
+        if (err) {
+          return res.status(500).send("Error updating data");
+        }
+        res.json({ message: "Data updated successfully" });
+      });
+    } else {
+      // Jika data belum ada, lakukan INSERT
+      const insertQuery = `INSERT INTO wla_token (wla, stock) VALUES (?, ?)`;
+      db.run(insertQuery, [wla, limitPerShift], (err) => {
+        if (err) {
+          return res.status(500).send("Error inserting data");
+        }
+        res.json({ message: "Data inserted successfully" });
+      });
+    }
   } catch (err) {
+    console.log(err);
     res.status(500).send("Error processing request");
   }
 });
